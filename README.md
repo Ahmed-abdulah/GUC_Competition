@@ -1,44 +1,117 @@
+# LeNet-5 CNN on FPGA — ZedBoard XC7Z020
 
+Hardware implementation of LeNet-5 for handwritten digit recognition (MNIST), built for the **IEEE CASS Seasonal School 2025 Digital Hardware Competition**.
 
-A complete, verified FPGA-accelerated implementation of the LeNet-5 Convolutional Neural Network for handwritten digit recognition (MNIST), featuring a custom RTL datapath and a companion Python software reference model.
+Covers the full stack: PyTorch training → Q6 fixed-point quantization → Verilog RTL → QuestaSim simulation → Vivado synthesis on Xilinx XC7Z020.
 
-## Overview
-
-This repository bridges the gap between high-level Machine Learning (Python/PyTorch) and low-level Digital Logic (Verilog). It is designed to take a trained floating-point model, quantize it to fixed-point integers, and execute it efficiently on a Xilinx Zynq-7000 (ZedBoard XC7Z020) FPGA using a custom neural accelerator.
-
----
-
-## 🐍 Software Model (Python)
-#### SW results
-<img width="1752" height="714" alt="Screenshot 2026-03-16 205721" src="https://github.com/user-attachments/assets/fbedfd00-d9ac-4fe0-bc78-ac44b097868b" />
-# LeNet-5 Hardware & Software Co-Design
-The `SW` side of this repository serves as the **Golden Mathematical Reference** for the hardware implementation. Because FPGAs use integer-based logic rather than floating-point math, the software strictly emulates the hardware constraints.
-
-* **Model Training:** `lenet5_trained.pth` is the standard PyTorch model trained on the MNIST dataset.
-* **Quantization (`weight_export.py`):** Extracts the PyTorch weights and mathematically quantizes them into strict **Q6 fixed-point (8-bit signed)** arrays. This ensures the hardware computes exactly the same numbers as the software.
-* **Golden Reference (`ref_hw_inference.py` / `trace_layers.py`):** These scripts emulate the exact integer math, memory boundaries, and clipping/ReLU behaviors of the Verilog implementation to verify mathematical correctness before FPGA synthesis.
-* **Test Automation:** `test_all.bat` automates the process of parsing `*.png` images (`prepare_digit2.py`), converting them to hex formats, and verifying the expected prediction.
+**Result: 10/10 digits correctly classified in RTL, matching the Python integer reference exactly.**
 
 ---
 
-## ⚙️ Hardware Design (RTL)
+## What's in here
 
-The `HW` side is written in strictly synthesizable Verilog (2001) targeted natively for mapping to FPGA DSP slices, LUTs, and Block RAMs. 
+```
+hw/
+├── lenet5_top_v2.v              top-level (UART, BRAM mux, master FSM, argmax)
+├── conv_maxpool_block_final.v   CONV1 + CONV2 + MaxPool (serial MAC)
+├── fc_control_v2.v              FC1, FC2, FC3 controller
+├── mac_unit_final.v             pipelined MAC unit
+├── fsm_control_final.v          master pipeline FSM
+├── bram_tdp.v                   8192×8 true dual-port BRAM
+├── rom_module.v                 parameterised weight/bias ROM
+├── uart.v                       UART RX/TX at 115200 baud
+├── pe_block.v                   PE block (ready for parallel upgrade)
+├── pe_matrix.v                  PE matrix (ready for parallel upgrade)
+├── pe_matrix_ctrl.v             PE controller (ready for parallel upgrade)
+├── zedboard.xdc                 timing + pin constraints
+├── hex_weights/                 quantized weights (10 × .hex)
+├── tb_10digits.v                10-digit verification testbench
+└── ref_hw_inference.py          integer golden reference model
 
-* **IO Interface (`uart.v`):** The design accepts streaming 28x28 grayscale images natively over a serial UART connection and transmits the final predicted classification character (e.g., `'6'`) back out.
-* **Memory Architecture (`bram_tdp.v`):** Feature maps and intermediate results (between Convolutional and Pooling steps) are stored and heavily multiplexed in a True Dual-Port Block RAM. Read-Only Memories (ROMs) store the quantized weights and biases.
-* **Spatial Processing (`conv_maxpool_block.v`):** Reads the image/features from BRAM, computes the 5x5 spatial convolutions across the filters using a robust **Serial MAC** architecture, performs 2x2 MaxPooling, and writes the reduced feature map back into BRAM.
-* **Dense Layers (`fc_control.v` & `mac_unit_final.v`):** Following the 2nd Pooling layer, the FSM pipelines and iteratively accumulates the Fully Connected layers (FC1, FC2, FC3) utilizing a dedicated pipelined Multiply-Accumulate block.
-* **Argmax Classification:** A sequential comparator evaluates the final 10 digits/logits, selecting the strongest digit classification to transmit.
+Lenet5.py                        PyTorch training
+weight_export.py                 weight quantization → hex files
+image_to_sim.py                  image preprocessing for simulation
+prepare_10digits.py              batch prep for all 10 digits
+trace_layers.py                  layer-by-layer output tracing
+```
 
 ---
 
-## 🚀 Quick Start for Verification
+## How to run
 
-1. **Prepare Data:** Run `test_all.bat` to convert your target `*.png` images into `sim_image.hex` arrays.
-2. **Execute RTL:** Load `tb.v` and the provided RTL modules into standard simulation tools (e.g., Questasim). Run the simulation to watch the hardware process the image hex.
-3. **Validate:** Run `compare_rtl_vs_ref.py` against the `results.log` generated by the Verilog testbench. This compares the output of the RTL to the golden mathematical software model at every single layer boundary to guarantee perfection.
+**1. Train and export weights**
+```bash
+python Lenet5.py
+python weight_export.py
+```
 
-### Note to Contributors
-* The hardware uses a strictly verified sequential Serial MAC architecture for dense layers and convolutions, prioritizing timing predictability and resource conservation for deployment on smaller FPGAs. 
-* All RTL comments have been intentionally stripped for maximum readability and clean compilation mapping. 
+**2. Prepare test images** (put `0.png`..`9.png` in `hw/`)
+```bash
+cd hw
+python prepare_10digits.py
+```
+This runs the Python integer reference on each image and writes `golden.txt`.
+
+**3. Simulate**
+```bash
+cd hw
+vdel -all -lib work && vlib work
+vlog bram_tdp.v rom_module.v ram_module.v pe_block.v pe_matrix.v pe_matrix_ctrl.v \
+     mac_unit_final.v conv_maxpool_block_final.v fc_control_v2.v \
+     fsm_control_final.v uart.v lenet5_top_v2.v tb_10digits.v
+vsim -c -do "run -all; quit" work.tb_10 2>&1 | tee sim_results.log
+```
+
+**4. Verify**
+```bash
+python compare_rtl_vs_ref.py
+```
+
+---
+
+## Architecture
+
+```
+UART RX (784 bytes)
+    │
+    ▼
+Feature Map BRAM  (8192 × 8-bit, single shared memory for all layers)
+    │
+    ├── CONV1  6 filters 5×5  28×28 → 24×24
+    ├── POOL1  2×2 max          24×24 → 12×12
+    ├── CONV2  16 filters 5×5  12×12 → 8×8   (6 serial batches)
+    ├── POOL2  2×2 max           8×8  → 4×4
+    ├── FC1    256 → 120  ReLU
+    ├── FC2    120 →  84  ReLU
+    └── FC3     84 →  10  (raw logits)
+    │
+    ▼
+Argmax → UART TX + LED
+```
+
+All arithmetic is **8-bit signed Q6 fixed-point** (6 fractional bits, scale = 64).
+
+### Note on the PE matrix files
+
+The paper specifies a 2D systolic PE array for convolution. Those files (`pe_block.v`, `pe_matrix.v`, `pe_matrix_ctrl.v`) are written and in the repo. The current implementation uses a serial single-MAC loop instead — this made verification practical and allowed finding all 7 bugs during development. The PE files are ready to wire in when throughput becomes a priority.
+
+---
+
+## Synthesis (Vivado 2019.1 — XC7Z020)
+
+| Resource | Used | Utilization |
+|----------|------|-------------|
+| LUTs | 9,189 | 3.03% |
+| Flip-Flops | 6,968 | 1.15% |
+| Block RAMs | 2.50 | 1.79% |
+| DSPs | 2 | 0.91% |
+
+---
+
+## Authors
+
+Ahmed Abdullah Abdelmonem Ibrahim  
+Mohammed Wael Mounir  
+Mohammed Ali Thabet
+
+German University in Cairo — IEEE CASS Seasonal School 2025
